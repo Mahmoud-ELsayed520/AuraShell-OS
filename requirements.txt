@@ -1,0 +1,7 @@
+SpeechRecognition
+pyaudio
+pyttsx3
+psutil
+CustomTkinter
+pygame
+google-generativeai
