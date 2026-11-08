@@ -5,3 +5,5 @@ psutil
 CustomTkinter
 pygame
 google-generativeai
+arabic-reshaper
+python-bidi
