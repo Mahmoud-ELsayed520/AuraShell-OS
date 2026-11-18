@@ -1,347 +1,345 @@
-import math
-import os
-import queue
-import re
-import shutil
-import struct
 import subprocess
+import sys
+import tempfile
 import threading
-import wave
+import time
+import types
+import unittest
 from pathlib import Path
+from unittest import mock
 
-SAMPLE_RATE = 44100
-SPEECH_RATE = 165
-SPEECH_VOLUME = 1.0
-MAX_TEXT_LENGTH = 300
-
-SOUND_DIR = Path(__file__).parent / "assets" / "sounds"
-
-EFFECTS = {
-    "listen_start": (400, 1200),
-    "listen_end": (1200, 400),
-}
+from core import tts as tts_module
 
 
-def _clean_text(text):
-    """Clean text before sending it to the speech engine."""
-    if not isinstance(text, str):
-        return ""
-
-    text = text[:MAX_TEXT_LENGTH]
-    text = re.sub(
-        r"[^a-zA-Z0-9\u0600-\u06FF\s.,!?;:'\"()\-]",
-        "",
-        text
-    )
-    return text.strip()
+class FakeVoice:
+    def __init__(self, voice_id, name, languages=()):
+        self.id = voice_id
+        self.name = name
+        self.languages = list(languages)
 
 
-def _is_arabic(text):
-    return bool(re.search(r"[\u0600-\u06FF]", text))
+EN_VOICE = FakeVoice("en-voice", "English", [b"\x05en-us"])
+AR_VOICE = FakeVoice("ar-voice", "Arabic", [b"\x02ar"])
 
 
-def _voice_languages(voice):
-    """Read language information from a pyttsx3 voice."""
-    values = [
-        getattr(voice, "id", ""),
-        getattr(voice, "name", ""),
-    ]
+class FakeEngine:
+    """Records what was said; can hold runAndWait() open with a gate."""
 
-    for language in getattr(voice, "languages", []):
-        if isinstance(language, bytes):
-            language = language.decode("utf-8", errors="ignore")
-        values.append(str(language))
+    def __init__(self, voices, gate=None):
+        self.props = {"rate": 200, "volume": 1.0, "voice": "default"}
+        self._voices = voices
+        self.gate = gate
+        self.entered = threading.Event()
+        self.said = []  # (text, voice id used)
+        self._pending = ""
 
-    return " ".join(values).lower()
+    def setProperty(self, key, value):
+        self.props[key] = value
 
+    def getProperty(self, key):
+        return self._voices if key == "voices" else self.props[key]
 
-def _find_voice(voices, language):
-    for voice in voices:
-        info = _voice_languages(voice)
+    def say(self, text):
+        self._pending = text
 
-        if language == "ar" and (
-            "arabic" in info
-            or re.search(r"(^|[^a-z])ar([^a-z]|$)", info)
-            or "ar-" in info
-            or "ar_" in info
-        ):
-            return voice
-
-        if language == "en" and (
-            "english" in info
-            or re.search(r"(^|[^a-z])en([^a-z]|$)", info)
-            or "en-" in info
-            or "en_" in info
-        ):
-            return voice
-
-    return None
-
-
-def _build_tone(path, start_freq, end_freq, duration=0.2):
-    total = int(SAMPLE_RATE * duration)
-    frames = bytearray()
-    phase = 0.0
-
-    for i in range(total):
-        progress = i / total
-        frequency = start_freq + (end_freq - start_freq) * progress
-        phase += 2 * math.pi * frequency / SAMPLE_RATE
-
-        value = (
-            math.sin(phase) + 0.4 * math.sin(2 * phase)
-        ) / 1.4
-
-        fade = math.sin(math.pi * progress)
-        sample = int(value * fade * 0.35 * 32767)
-        frames += struct.pack("<h", sample)
-
-    with wave.open(str(path), "wb") as wav:
-        wav.setnchannels(1)
-        wav.setsampwidth(2)
-        wav.setframerate(SAMPLE_RATE)
-        wav.writeframes(bytes(frames))
-
-
-class TextToSpeech:
-    """Thread-safe speech service using one dedicated pyttsx3 worker."""
-
-    def __init__(
-        self,
-        voice_id=None,
-        rate=SPEECH_RATE,
-        volume=SPEECH_VOLUME,
-        on_error=None,
-        on_status=None,
-    ):
-        self.voice_id = voice_id
-        self.rate = rate
-        self.volume = volume
-        self.on_error = on_error
-        self.on_status = on_status
-
-        self._queue = queue.Queue()
-        self._engine = None
-        self._engine_ready = threading.Event()
-        self._closed = False
-        self._state_lock = threading.Lock()
-
-        self._worker = threading.Thread(
-            target=self._worker_loop,
-            name="TTS-Worker",
-            daemon=True,
-        )
-        self._worker.start()
-        self._engine_ready.wait()
-
-    def _report_error(self, error):
-        if self.on_error:
-            try:
-                self.on_error(str(error))
-            except Exception:
-                pass
-
-    def _report_status(self, status):
-        if self.on_status:
-            try:
-                self.on_status(status)
-            except Exception as error:
-                self._report_error(error)
-
-    def _worker_loop(self):
-        try:
-            import pyttsx3
-
-            self._engine = pyttsx3.init()
-            self._engine.setProperty("rate", self.rate)
-            self._engine.setProperty("volume", self.volume)
-
-            if self.voice_id:
-                self._engine.setProperty("voice", self.voice_id)
-
-        except Exception as error:
-            self._report_error(error)
-            self._engine_ready.set()
-            return
-
-        self._engine_ready.set()
-
-        while True:
-            task = self._queue.get()
-
-            if task is None:
-                break
-
-            text, finished, result = task
-
-            try:
-                if self._engine is None:
-                    raise RuntimeError("TTS engine is unavailable")
-
-                voices = self._engine.getProperty("voices") or []
-
-                if _is_arabic(text):
-                    voice = _find_voice(voices, "ar")
-
-                    if voice is None:
-                        raise RuntimeError(
-                            "No Arabic voice is installed. "
-                            "Install an Arabic speech voice."
-                        )
-                else:
-                    voice = _find_voice(voices, "en")
-
-                if voice:
-                    self._engine.setProperty("voice", voice.id)
-
-                self._report_status("speaking")
-                self._engine.say(text)
-                self._engine.runAndWait()
-                result["success"] = True
-
-            except Exception as error:
-                self._report_error(error)
-                result["success"] = False
-
-            finally:
-                self._report_status("idle")
-                finished.set()
-                self._queue.task_done()
-
-    def speak(self, text, block=True):
-        text = _clean_text(text)
-
-        if not text or self._closed:
-            return False
-
-        if self._engine is None or not self._worker.is_alive():
-            self._report_error("TTS engine is unavailable")
-            return False
-
-        finished = threading.Event()
-        result = {"success": False}
-
-        self._queue.put((text, finished, result))
-
-        if not block:
-            return True
-
-        finished.wait()
-        return result["success"]
+    def runAndWait(self):
+        self.said.append((self._pending, self.props["voice"]))
+        self.entered.set()
+        if self.gate is not None:
+            self.gate.wait(5)
 
     def stop(self):
-        """Stop current speech and cancel pending speech requests."""
-        if self._engine is not None:
-            try:
-                self._engine.stop()
-            except Exception as error:
-                self._report_error(error)
+        if self.gate is not None:
+            self.gate.set()  # an interrupted sentence returns at once
 
-        while True:
-            try:
-                task = self._queue.get_nowait()
 
-                if task is None:
-                    self._queue.task_done()
-                    continue
-
-                _, finished, result = task
-                result["success"] = False
-                finished.set()
-                self._queue.task_done()
-
-            except queue.Empty:
-                break
-
-    def play_effect(self, effect_id):
-        if effect_id not in EFFECTS:
-            raise ValueError(f"Unknown sound effect: {effect_id}")
-
-        SOUND_DIR.mkdir(parents=True, exist_ok=True)
-
-        path = SOUND_DIR / f"{effect_id}.wav"
-
-        if not path.exists():
-            _build_tone(path, *EFFECTS[effect_id])
-
-        player = shutil.which("paplay") or shutil.which("aplay")
-
-        if not player:
-            self._report_error("Neither paplay nor aplay is installed")
-            return False
-
-        command = (
-            [player, str(path)]
-            if player.endswith("paplay")
-            else [player, "-q", str(path)]
-        )
-
-        try:
-            subprocess.run(
-                command,
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+def wait_until(condition, timeout=3.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if condition():
             return True
-        except (OSError, subprocess.SubprocessError) as error:
-            self._report_error(error)
-            return False
-
-    def close(self):
-        if self._closed:
-            return
-
-        self._closed = True
-        self.stop()
-        self._queue.put(None)
-
-        if threading.current_thread() != self._worker:
-            self._worker.join(timeout=5)
-
-        if self._worker.is_alive():
-            self._report_error("TTS worker did not stop within 5 seconds")
+        time.sleep(0.01)
+    return condition()
 
 
-# Backward compatibility with existing project calls.
-_default_tts = None
+class TtsTestCase(unittest.TestCase):
+    def make_tts(self, voices=None, gate=None, **kwargs):
+        engine = FakeEngine([EN_VOICE, AR_VOICE] if voices is None else voices,
+                            gate)
+        self.errors = []
+        self.statuses = []
+        kwargs.setdefault("on_error", self.errors.append)
+        kwargs.setdefault("on_status", self.statuses.append)
+        fake_module = types.SimpleNamespace(init=lambda: engine)
+        with mock.patch.dict(sys.modules, {"pyttsx3": fake_module}):
+            service = tts_module.TextToSpeech(**kwargs)
+        self.addCleanup(service.close)
+        return service, engine
 
 
-def _get_default_tts():
-    global _default_tts
+class TextHelpersTests(unittest.TestCase):
+    def test_non_string_becomes_empty(self):
+        self.assertEqual(tts_module._clean_text(None), "")
+        self.assertEqual(tts_module._clean_text(123), "")
 
-    if _default_tts is None:
-        _default_tts = TextToSpeech()
+    def test_symbols_removed_arabic_kept(self):
+        self.assertEqual(tts_module._clean_text("hello <b>world</b> {x}"),
+                         "hello bworldb x")
+        self.assertEqual(tts_module._clean_text("  مرحبا   بك  "), "مرحبا بك")
 
-    return _default_tts
+    def test_long_text_is_cut_at_a_word_boundary(self):
+        cleaned = tts_module._clean_text("word " * 200)
+        self.assertLessEqual(len(cleaned), tts_module.MAX_TEXT_LENGTH)
+        self.assertTrue(cleaned.endswith("word"))
+
+    def test_is_arabic(self):
+        self.assertTrue(tts_module._is_arabic("افتح المتصفح"))
+        self.assertFalse(tts_module._is_arabic("open the browser"))
+
+    def test_find_voice_uses_language_codes(self):
+        voices = [EN_VOICE, AR_VOICE]
+        self.assertIs(tts_module._find_voice(voices, "ar"), AR_VOICE)
+        self.assertIs(tts_module._find_voice(voices, "en"), EN_VOICE)
+        self.assertIsNone(tts_module._find_voice([EN_VOICE], "ar"))
+
+    def test_find_voice_does_not_match_inside_words(self):
+        voice = FakeVoice("clear-voice", "Clear Standard", [])
+        self.assertIsNone(tts_module._find_voice([voice], "ar"))
 
 
-def speak(text, block=True):
-    return _get_default_tts().speak(text, block=block)
+class SpeakTests(TtsTestCase):
+    def test_english_uses_english_voice(self):
+        service, engine = self.make_tts()
+        self.assertTrue(service.speak("Browser opened"))
+        self.assertEqual(engine.said[-1], ("Browser opened", "en-voice"))
+
+    def test_arabic_uses_arabic_voice_then_english_switches_back(self):
+        service, engine = self.make_tts()
+        self.assertTrue(service.speak("تم فتح المتصفح"))
+        self.assertEqual(engine.said[-1][1], "ar-voice")
+        self.assertTrue(service.speak("Done"))
+        self.assertEqual(engine.said[-1][1], "en-voice")
+
+    def test_arabic_without_arabic_voice_fails_loudly(self):
+        service, engine = self.make_tts(voices=[EN_VOICE])
+        self.assertFalse(service.speak("مرحبا"))
+        self.assertEqual(engine.said, [])
+        self.assertTrue(any("No Arabic voice" in e for e in self.errors))
+
+    def test_no_english_voice_returns_to_the_default_voice(self):
+        service, engine = self.make_tts(voices=[AR_VOICE])
+        self.assertTrue(service.speak("مرحبا"))
+        self.assertEqual(engine.said[-1][1], "ar-voice")
+        self.assertTrue(service.speak("Hello"))
+        self.assertEqual(engine.said[-1][1], "default")
+
+    def test_pinned_voice_disables_auto_selection(self):
+        service, engine = self.make_tts(voices=[EN_VOICE], voice_id="custom")
+        self.assertTrue(service.speak("مرحبا"))
+        self.assertEqual(engine.said[-1][1], "custom")
+
+    def test_empty_and_non_string_text_is_not_spoken(self):
+        service, engine = self.make_tts()
+        self.assertFalse(service.speak(""))
+        self.assertFalse(service.speak("   "))
+        self.assertFalse(service.speak(None))
+        self.assertEqual(engine.said, [])
+
+    def test_non_blocking_returns_at_once_and_keeps_order(self):
+        gate = threading.Event()
+        service, engine = self.make_tts(gate=gate)
+        started = time.monotonic()
+        self.assertTrue(service.speak("one", block=False))
+        self.assertTrue(engine.entered.wait(2))
+        self.assertTrue(service.speak("two", block=False))
+        self.assertTrue(service.speak("three", block=False))
+        self.assertLess(time.monotonic() - started, 1.0)
+        gate.set()
+        self.assertTrue(wait_until(lambda: len(engine.said) == 3))
+        self.assertEqual([t for t, _ in engine.said], ["one", "two", "three"])
+
+    def test_idle_is_reported_only_when_the_queue_is_empty(self):
+        gate = threading.Event()
+        service, engine = self.make_tts(gate=gate)
+        service.speak("one", block=False)
+        self.assertTrue(engine.entered.wait(2))
+        service.speak("two", block=False)
+        gate.set()
+        self.assertTrue(wait_until(lambda: self.statuses[-1:] == ["idle"]))
+        self.assertEqual(self.statuses.count("idle"), 1)
+        self.assertEqual(self.statuses.count("speaking"), 2)
+
+    def test_stop_interrupts_current_and_cancels_queued(self):
+        gate = threading.Event()
+        service, engine = self.make_tts(gate=gate)
+        outcome = {}
+        thread = threading.Thread(
+            target=lambda: outcome.update(ok=service.speak("first")))
+        thread.start()
+        self.assertTrue(engine.entered.wait(2))
+        service.speak("second", block=False)
+        service.stop()
+        thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(outcome["ok"])  # interrupted is not a success
+        time.sleep(0.1)
+        self.assertEqual([t for t, _ in engine.said], ["first"])
+
+    def test_available_voices_lists_plain_dicts(self):
+        service, _ = self.make_tts()
+        voices = service.available_voices()
+        self.assertEqual([v["id"] for v in voices], ["en-voice", "ar-voice"])
+        voices[0]["id"] = "changed"
+        self.assertEqual(service.available_voices()[0]["id"], "en-voice")
 
 
-def play_effect(effect_id):
-    return _get_default_tts().play_effect(effect_id)
+class LifecycleTests(TtsTestCase):
+    def test_engine_start_failure_is_reported(self):
+        errors = []
+
+        def broken_init():
+            raise RuntimeError("no audio device")
+
+        fake_module = types.SimpleNamespace(init=broken_init)
+        with mock.patch.dict(sys.modules, {"pyttsx3": fake_module}):
+            service = tts_module.TextToSpeech(on_error=errors.append)
+        self.addCleanup(service.close)
+        self.assertFalse(service.is_available())
+        self.assertFalse(service.speak("hello"))
+        self.assertTrue(any("failed to start" in e for e in errors))
+
+    def test_constructor_does_not_hang_if_the_engine_hangs(self):
+        release = threading.Event()
+        engine = FakeEngine([EN_VOICE])
+        errors = []
+
+        def slow_init():
+            release.wait(5)
+            return engine
+
+        fake_module = types.SimpleNamespace(init=slow_init)
+        with mock.patch.object(tts_module, "ENGINE_START_TIMEOUT", 0.2), \
+                mock.patch.dict(sys.modules, {"pyttsx3": fake_module}):
+            started = time.monotonic()
+            service = tts_module.TextToSpeech(on_error=errors.append)
+        self.addCleanup(service.close)
+        self.addCleanup(release.set)  # runs first (LIFO)
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertTrue(any("did not start" in e for e in errors))
+        self.assertFalse(service.speak("hello"))
+
+    def test_close_stops_the_worker_and_is_idempotent(self):
+        service, _ = self.make_tts()
+        service.close()
+        service.close()
+        self.assertFalse(service._worker.is_alive())
+        self.assertFalse(service.is_available())
+        self.assertFalse(service.speak("after close"))
+
+    def test_stop_after_close_does_not_hang(self):
+        service, _ = self.make_tts()
+        service.close()
+        service.stop()
+
+    def test_context_manager_closes(self):
+        engine = FakeEngine([EN_VOICE])
+        fake_module = types.SimpleNamespace(init=lambda: engine)
+        with mock.patch.dict(sys.modules, {"pyttsx3": fake_module}):
+            with tts_module.TextToSpeech() as service:
+                self.assertTrue(service.speak("hi"))
+        self.assertFalse(service._worker.is_alive())
+
+    def test_broken_callback_does_not_kill_the_worker(self):
+        def bad_status(_):
+            raise ValueError("boom")
+
+        service, engine = self.make_tts(on_status=bad_status)
+        self.assertTrue(service.speak("one"))
+        self.assertTrue(service.speak("two"))
+        self.assertEqual(len(engine.said), 2)
 
 
-def play_listen_start():
-    return play_effect("listen_start")
+class EffectTests(TtsTestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.sound_dir = Path(self._tmp.name) / "sounds"
+        patcher = mock.patch.object(tts_module, "SOUND_DIR", self.sound_dir)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
+    @staticmethod
+    def _which(*available):
+        return lambda name, path=None: (
+            f"/usr/bin/{name}" if name in available else None)
 
-def play_listen_end():
-    return play_effect("listen_end")
+    def test_unknown_effect_is_rejected(self):
+        service, _ = self.make_tts()
+        with self.assertRaises(ValueError):
+            service.play_effect("../../etc/passwd")
+        with self.assertRaises(ValueError):
+            service.play_effect("nope")
+
+    def test_effect_is_written_privately_and_played_safely(self):
+        service, _ = self.make_tts()
+        with mock.patch.object(tts_module.shutil, "which",
+                               self._which("paplay")), \
+                mock.patch.object(tts_module.subprocess, "run") as run:
+            self.assertTrue(service.play_effect("listen_start"))
+        wav = self.sound_dir / "listen_start.wav"
+        self.assertTrue(wav.is_file())
+        self.assertEqual(wav.read_bytes()[:4], b"RIFF")
+        self.assertEqual(sorted(p.name for p in self.sound_dir.iterdir()),
+                         ["listen_start.wav"])  # no temp file left behind
+        self.assertEqual(self.sound_dir.stat().st_mode & 0o777, 0o700)
+        args, kwargs = run.call_args
+        self.assertEqual(args[0], ["/usr/bin/paplay", str(wav)])
+        self.assertEqual(kwargs["timeout"], tts_module.EFFECT_TIMEOUT)
+        self.assertFalse(kwargs.get("shell", False))
+
+    def test_aplay_fallback_is_quiet(self):
+        service, _ = self.make_tts()
+        with mock.patch.object(tts_module.shutil, "which",
+                               self._which("aplay")), \
+                mock.patch.object(tts_module.subprocess, "run") as run:
+            self.assertTrue(service.play_effect("listen_end"))
+        self.assertEqual(run.call_args[0][0][:2], ["/usr/bin/aplay", "-q"])
+
+    def test_broken_existing_file_is_rebuilt(self):
+        self.sound_dir.mkdir(parents=True)
+        (self.sound_dir / "listen_start.wav").write_bytes(b"x")
+        service, _ = self.make_tts()
+        with mock.patch.object(tts_module.shutil, "which",
+                               self._which("paplay")), \
+                mock.patch.object(tts_module.subprocess, "run"):
+            self.assertTrue(service.play_effect("listen_start"))
+        size = (self.sound_dir / "listen_start.wav").stat().st_size
+        self.assertGreater(size, 44)
+
+    def test_no_player_installed(self):
+        service, _ = self.make_tts()
+        with mock.patch.object(tts_module.shutil, "which",
+                               self._which()):
+            self.assertFalse(service.play_effect("listen_start"))
+        self.assertTrue(any("paplay nor aplay" in e for e in self.errors))
+
+    def test_player_timeout_does_not_hang_the_app(self):
+        service, _ = self.make_tts()
+        with mock.patch.object(tts_module.shutil, "which",
+                               self._which("paplay")), \
+                mock.patch.object(
+                    tts_module.subprocess, "run",
+                    side_effect=subprocess.TimeoutExpired("paplay", 5)):
+            self.assertFalse(service.play_effect("listen_start"))
+        self.assertTrue(any("Could not play" in e for e in self.errors))
+
+    def test_unwritable_sound_folder_is_reported(self):
+        service, _ = self.make_tts()
+        with mock.patch.object(tts_module, "_ensure_sound",
+                               side_effect=PermissionError("denied")):
+            self.assertFalse(service.play_effect("listen_start"))
+        self.assertTrue(any("prepare sound effect" in e for e in self.errors))
 
 
 if __name__ == "__main__":
-    tts = TextToSpeech(
-        on_error=lambda error: print("[TTS ERROR]", error),
-        on_status=lambda status: print("[TTS STATUS]", status),
-    )
-
-    try:
-        tts.play_effect("listen_start")
-        print("English:", tts.speak("Aura Shell online. How can I help you?"))
-        print("Arabic:", tts.speak("مرحبا بك في نظام أورا شيل"))
-        tts.play_effect("listen_end")
-    finally:
-        tts.close()
+    unittest.main()

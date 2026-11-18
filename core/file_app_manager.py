@@ -9,11 +9,33 @@ Design rules (see PROJECT_PLAN.md, section 5):
   list, ``shell=False`` and no stdin.
 * File opening is restricted to user-approved roots. Paths are resolved
   (symlinks and ``..`` included) *before* the root check.
+* File operations (``list_dir``, ``create_file``, ``create_folder``,
+  ``rename``, ``delete``) work ONLY inside one private workspace folder
+  (default ``~/AuraShell_Workspace``, mode 0700, created on first use). They
+  accept a single plain file NAME, never a path. Symbolic links are refused.
+  ``delete`` moves regular files to the desktop trash (``gio trash``) and
+  never deletes permanently; if the trash is unavailable nothing is deleted.
+  Confirmation for ``delete`` is the executor's job, not this module's.
 * Failures raise domain exceptions; nothing is converted into fake success.
 
-Threading note: ``open_app``, ``close_app`` and ``open_path`` are BLOCKING
-(bounded by ``launch_check_seconds``, ``close_timeout`` and ``open_wait``).
-Callers on a GUI thread must run them in a worker thread.
+Threading note: ``open_app``, ``close_app``, ``close_all_closable``,
+``open_path`` and ``delete`` are BLOCKING (bounded by ``launch_check_seconds``,
+``close_timeout`` and ``open_wait``). Callers on a GUI thread must run them in
+a worker thread. Internal process tracking is protected by a lock, so one
+manager may be shared by several worker threads.
+
+Known limits (documented on purpose):
+
+* There is a tiny gap between validating a path and ``xdg-open`` using it
+  (TOCTOU). A local attacker who can already write inside an approved folder
+  could swap a file for a symlink in that gap. Approved roots should therefore
+  be folders only the current user can write to.
+* ``rename`` checks that the destination is free and then renames; another
+  process could create the destination in that tiny gap and be overwritten.
+  The workspace is private (0700), so only this user's processes can do that.
+* Files on filesystems without Unix permissions (NTFS, FAT, some network
+  mounts) look executable to the OS, so ``open_path`` refuses them. This errs
+  on the safe side.
 
 Logging: events are logged on the ``core.file_app_manager`` logger. Only
 canonical app IDs and denial reasons are logged, never full file paths,
@@ -22,11 +44,13 @@ recognized text, or process command lines.
 
 from __future__ import annotations
 
-import getpass
 import logging
 import os
+import re
 import shutil
+import stat
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -39,6 +63,13 @@ except ImportError:  # pragma: no cover - depends on environment
 logger = logging.getLogger(__name__)
 
 MAX_PATH_LENGTH = 4096
+MAX_NAME_LENGTH = 128
+DEFAULT_WORKSPACE = "~/AuraShell_Workspace"
+LIST_DEFAULT_LIMIT = 50
+LIST_MAX_LIMIT = 200
+TRASH_TIMEOUT_SECONDS = 10
+# Control characters (incl. NUL and newline) and path separators.
+_FORBIDDEN_NAME_CHARS = re.compile(r"[\x00-\x1f\x7f/\\]")
 TRUSTED_EXECUTABLE_DIRS: tuple[str, ...] = (
     "/usr/local/bin",
     "/usr/bin",
@@ -51,8 +82,16 @@ BLOCKED_SUFFIXES = frozenset(
     {
         ".desktop", ".sh", ".bash", ".run", ".appimage", ".bin", ".exe",
         ".bat", ".cmd", ".com", ".jar", ".py", ".pl", ".rb", ".service",
+        ".pyw", ".pyc", ".js", ".mjs", ".php", ".ps1", ".vbs", ".jnlp",
+        ".url", ".lnk", ".deb", ".rpm", ".snap", ".so",
+        ".html", ".htm", ".xhtml",
     }
 )
+
+
+def _current_uid() -> int:
+    """Real UID of this process (not taken from environment variables)."""
+    return os.getuid()
 
 
 # --------------------------------------------------------------------------
@@ -98,6 +137,18 @@ class AccessDeniedError(FileAppManagerError):
     """The operating system denied permission."""
 
 
+class PathAlreadyExistsError(FileAppManagerError):
+    """A file or folder with that name already exists."""
+
+
+class NotAFileError(FileAppManagerError):
+    """The item is not a regular file (for example a folder)."""
+
+
+class FileOperationError(FileAppManagerError):
+    """A file operation failed for a reason other than the specific errors."""
+
+
 # --------------------------------------------------------------------------
 # Registry
 # --------------------------------------------------------------------------
@@ -112,6 +163,8 @@ class AppSpec:
     closable: bool = True
 
 
+FIREFOX_PROCESSES = ("firefox", "firefox-bin", "firefox-esr")
+
 APP_REGISTRY: dict[str, AppSpec] = {
     spec.app_id: spec
     for spec in (
@@ -123,8 +176,15 @@ APP_REGISTRY: dict[str, AppSpec] = {
                 closable=False),
         AppSpec("calculator", ("gnome-calculator", "kcalc", "galculator"),
                 process_names=("gnome-calculator", "kcalc", "galculator")),
-        AppSpec("browser", ("firefox", "x-www-browser"),
-                process_names=("firefox",)),
+        # Only "firefox": an alternatives symlink such as x-www-browser could
+        # start a browser whose process name we do not list for closing.
+        AppSpec("browser", ("firefox",), process_names=FIREFOX_PROCESSES),
+        AppSpec("firefox", ("firefox",), process_names=FIREFOX_PROCESSES),
+        AppSpec("files", ("nautilus",), process_names=("nautilus",)),
+        AppSpec("editor", ("gnome-text-editor", "gedit"),
+                process_names=("gnome-text-editor", "gedit")),
+        AppSpec("system_monitor", ("gnome-system-monitor",),
+                process_names=("gnome-system-monitor",)),
     )
 }
 
@@ -134,7 +194,8 @@ class FileAppManager:
 
     All public methods that touch processes are blocking; see module docs.
     Every failure is a subclass of :class:`FileAppManagerError`, except
-    ``TypeError`` for arguments that are not strings.
+    ``TypeError`` for arguments that are not strings and ``ValueError`` for
+    an out-of-range ``limit``.
     """
 
     def __init__(
@@ -143,17 +204,22 @@ class FileAppManager:
         *,
         search_dirs: Sequence[str] = TRUSTED_EXECUTABLE_DIRS,
         registry: dict[str, AppSpec] | None = None,
+        workspace_root: str | os.PathLike[str] | None = None,
         launch_check_seconds: float = 0.5,
         close_timeout: float = 3.0,
         open_wait: float = 3.0,
     ) -> None:
         self._registry = dict(registry if registry is not None else APP_REGISTRY)
         self._search_path = os.pathsep.join(search_dirs)
+        self._workspace_path = Path(
+            workspace_root if workspace_root is not None else DEFAULT_WORKSPACE
+        ).expanduser()
         self._launch_check = launch_check_seconds
         self._close_timeout = close_timeout
         self._open_wait = open_wait
         # app_id -> processes we started that may still be running.
         self._launched: dict[str, list[subprocess.Popen]] = {}
+        self._lock = threading.RLock()  # guards self._launched
 
         if allowed_roots is None:
             home = Path.home()
@@ -204,12 +270,13 @@ class FileAppManager:
         ``Popen.poll()`` collects the exit status, so finished children do not
         stay behind as zombies.
         """
-        for app_id in list(self._launched):
-            alive = [p for p in self._launched[app_id] if p.poll() is None]
-            if alive:
-                self._launched[app_id] = alive
-            else:
-                del self._launched[app_id]
+        with self._lock:
+            for app_id in list(self._launched):
+                alive = [p for p in self._launched[app_id] if p.poll() is None]
+                if alive:
+                    self._launched[app_id] = alive
+                else:
+                    del self._launched[app_id]
 
     def list_available_apps(self) -> list[str]:
         """Return sorted IDs of registry apps that are installed."""
@@ -266,15 +333,17 @@ class FileAppManager:
             raise AccessDeniedError(
                 f"Permission denied launching '{spec.app_id}'.") from exc
         except OSError as exc:
-            logger.error("Launch failed for '%s': %s", spec.app_id, exc)
-            raise AppLaunchError(f"Could not launch '{spec.app_id}': {exc}") from exc
+            logger.error("Launch failed for '%s': %s", spec.app_id,
+                         type(exc).__name__)
+            raise AppLaunchError(f"Could not launch '{spec.app_id}'.") from exc
 
         # Detect immediate crashes without blocking on long-running apps.
         try:
             code = proc.wait(timeout=self._launch_check)
         except subprocess.TimeoutExpired:
-            self._reap_launched()
-            self._launched.setdefault(spec.app_id, []).append(proc)
+            with self._lock:
+                self._reap_launched()
+                self._launched.setdefault(spec.app_id, []).append(proc)
             logger.info("Launched '%s'", spec.app_id)
             return
         if code != 0:
@@ -316,41 +385,71 @@ class FileAppManager:
                         spec.app_id)
             raise AppNotRunningError(f"'{spec.app_id}' is not running.")
 
-        for proc in victims:
+        denied = False
+        for proc in victims:  # try every process before reporting a denial
             try:
                 proc.terminate()  # SIGTERM only; never SIGKILL
             except psutil.NoSuchProcess:
                 continue
-            except psutil.AccessDenied as exc:
-                logger.warning("Close denied for '%s' by the OS", spec.app_id)
-                raise AccessDeniedError(
-                    f"Permission denied closing '{spec.app_id}'.") from exc
+            except psutil.AccessDenied:
+                denied = True
+        if denied:
+            logger.warning("Close denied for '%s' by the OS", spec.app_id)
+            raise AccessDeniedError(
+                f"Permission denied closing '{spec.app_id}'.")
 
         _, alive = psutil.wait_procs(victims, timeout=self._close_timeout)
         if alive:
             logger.error("'%s' did not exit after the close request", spec.app_id)
             raise AppCloseError(
                 f"'{spec.app_id}' did not exit after the close request.")
-        self._launched.pop(spec.app_id, None)
+        with self._lock:
+            self._launched.pop(spec.app_id, None)
         logger.info("Closed '%s'", spec.app_id)
+
+    def close_all_closable(self) -> dict[str, list[str]]:
+        """Close every reviewed, closable app. BLOCKING.
+
+        Apps that are not running are reported separately and are NOT
+        failures, so "panic" with nothing open is a normal success.
+
+        Returns:
+            ``{"closed": [...], "not_running": [...], "failed": [...]}``
+        """
+        closed: list[str] = []
+        not_running: list[str] = []
+        failed: list[str] = []
+        for app_id in self.list_closable_apps():
+            try:
+                self.close_app(app_id)
+                closed.append(app_id)
+            except AppNotRunningError:
+                not_running.append(app_id)
+            except FileAppManagerError:
+                failed.append(app_id)
+        return {"closed": closed, "not_running": not_running, "failed": failed}
 
     def _find_processes(self, spec: AppSpec) -> list:
         """Own-user processes matching the spec, plus ones we launched."""
         self._reap_launched()
-        me, own_pid = getpass.getuser(), os.getpid()
+        uid, own_pid = _current_uid(), os.getpid()
         names = {n.casefold() for n in spec.process_names}
         found: dict[int, object] = {}
 
-        for proc in psutil.process_iter(["name", "username"]):
+        for proc in psutil.process_iter(["name", "uids"]):
             info = proc.info
+            uids = info.get("uids")
             if (
                 (info.get("name") or "").casefold() in names
-                and info.get("username") == me
+                and uids is not None
+                and uids.real == uid
                 and proc.pid != own_pid
             ):
                 found[proc.pid] = proc
 
-        for tracked in self._launched.get(spec.app_id, []):
+        with self._lock:
+            tracked_list = list(self._launched.get(spec.app_id, []))
+        for tracked in tracked_list:
             if tracked.poll() is not None:
                 continue
             try:
@@ -435,7 +534,8 @@ class FileAppManager:
         except PermissionError as exc:
             raise AccessDeniedError("Permission denied launching opener.") from exc
         except OSError as exc:
-            raise AppLaunchError(f"Could not open path: {exc}") from exc
+            logger.error("Opener failed to start: %s", type(exc).__name__)
+            raise AppLaunchError("Could not open the path.") from exc
 
         try:
             code = proc.wait(timeout=self._open_wait)
@@ -447,3 +547,191 @@ class FileAppManager:
         if code != 0:
             raise AppLaunchError(f"xdg-open failed with exit code {code}.")
         logger.info("Opened a path")
+
+    # ------------------------------------------------------- workspace files
+    def _workspace(self) -> Path:
+        """Return the resolved private workspace, creating it on first use."""
+        try:
+            self._workspace_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+            resolved = self._workspace_path.resolve(strict=True)
+            info = resolved.stat()
+        except PermissionError as exc:
+            raise AccessDeniedError("Permission denied for the workspace.") from exc
+        except (OSError, RuntimeError) as exc:
+            raise FileOperationError("The workspace is not available.") from exc
+        if not resolved.is_dir():
+            raise PathNotAllowedError("The workspace is not a folder.")
+        if info.st_uid != _current_uid():
+            raise PathNotAllowedError(
+                "The workspace is not owned by the current user.")
+        return resolved
+
+    def _safe_child(self, name: object) -> Path:
+        """Validate a single file NAME and return its path in the workspace."""
+        try:
+            return self._safe_child_unlogged(name)
+        except FileAppManagerError as exc:
+            logger.warning("File name rejected: %s", exc)
+            raise
+
+    def _safe_child_unlogged(self, name: object) -> Path:
+        if not isinstance(name, str):
+            raise TypeError("name must be a string")
+        name = name.strip()
+        if (
+            not name
+            or len(name) > MAX_NAME_LENGTH
+            or _FORBIDDEN_NAME_CHARS.search(name)
+            or name in {".", ".."}
+            or name.startswith("-")
+        ):
+            raise PathNotAllowedError("Invalid file name.")
+        workspace = self._workspace()
+        child = workspace / name
+        if child.parent != workspace:  # defensive; the checks above prevent it
+            raise PathNotAllowedError("Path is outside the workspace.")
+        if child.is_symlink():
+            raise PathNotAllowedError("Symbolic links are not supported.")
+        return child
+
+    @staticmethod
+    def _os_error(exc: OSError) -> FileAppManagerError:
+        """Map an OSError to a domain error without leaking its details."""
+        if isinstance(exc, PermissionError):
+            return AccessDeniedError("Permission denied.")
+        if isinstance(exc, FileNotFoundError):
+            return PathNotFoundError("Path does not exist.")
+        return FileOperationError("The file operation failed.")
+
+    def list_dir(
+        self, limit: int = LIST_DEFAULT_LIMIT, *, include_hidden: bool = False
+    ) -> dict[str, object]:
+        """List the workspace (folders first, then names, case-insensitive).
+
+        Returns ``{"total": int, "items": [{"name", "type", "size"}],
+        "truncated": bool}``. ``type`` is ``file``, ``folder``, ``link`` or
+        ``other``; ``size`` is in bytes for files, otherwise ``None``.
+        ``total`` is the real number of entries, ``items`` holds at most
+        ``limit``. Hidden (dot) files are skipped unless requested.
+        """
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise TypeError("limit must be an integer")
+        if not 1 <= limit <= LIST_MAX_LIMIT:
+            raise ValueError(f"limit must be between 1 and {LIST_MAX_LIMIT}")
+        workspace = self._workspace()
+        items: list[dict[str, object]] = []
+        try:
+            with os.scandir(workspace) as entries:
+                for entry in entries:
+                    if not include_hidden and entry.name.startswith("."):
+                        continue
+                    kind: str
+                    size: int | None = None
+                    try:
+                        if entry.is_symlink():
+                            kind = "link"
+                        elif entry.is_dir(follow_symlinks=False):
+                            kind = "folder"
+                        elif entry.is_file(follow_symlinks=False):
+                            kind = "file"
+                            size = entry.stat(follow_symlinks=False).st_size
+                        else:
+                            kind = "other"
+                    except OSError:
+                        kind = "other"
+                    items.append({"name": entry.name, "type": kind, "size": size})
+        except OSError as exc:
+            raise self._os_error(exc) from exc
+        items.sort(key=lambda i: (i["type"] != "folder",
+                                  str(i["name"]).casefold(), str(i["name"])))
+        total = len(items)
+        return {"total": total, "items": items[:limit], "truncated": total > limit}
+
+    def create_file(self, name: str) -> None:
+        """Create a new empty file (mode 0600) in the workspace.
+
+        Raises:
+            TypeError: ``name`` is not a string.
+            PathNotAllowedError: invalid name or a symbolic link.
+            PathAlreadyExistsError: something with that name exists.
+            AccessDeniedError / FileOperationError: OS-level failures.
+        """
+        path = self._safe_child(name)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(path, flags, 0o600)
+        except FileExistsError as exc:
+            raise PathAlreadyExistsError(
+                "A file or folder with that name already exists.") from exc
+        except OSError as exc:
+            raise self._os_error(exc) from exc
+        os.close(fd)
+        logger.info("Created a file")
+
+    def create_folder(self, name: str) -> None:
+        """Create a new folder (mode 0700) in the workspace."""
+        path = self._safe_child(name)
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError as exc:
+            raise PathAlreadyExistsError(
+                "A file or folder with that name already exists.") from exc
+        except OSError as exc:
+            raise self._os_error(exc) from exc
+        logger.info("Created a folder")
+
+    def rename(self, old_name: str, new_name: str) -> None:
+        """Rename a file or folder inside the workspace; never overwrites."""
+        source = self._safe_child(old_name)
+        target = self._safe_child(new_name)
+        if not os.path.lexists(source):
+            raise PathNotFoundError("The item to rename does not exist.")
+        if os.path.lexists(target):
+            raise PathAlreadyExistsError(
+                "A file or folder with the new name already exists.")
+        try:
+            os.rename(source, target)
+        except OSError as exc:
+            raise self._os_error(exc) from exc
+        logger.info("Renamed an item")
+
+    def delete(self, name: str) -> None:
+        """Move a regular file to the trash. BLOCKING up to 10 seconds.
+
+        Folders and links are refused. If ``gio`` is missing or the trash
+        fails, the file is left untouched: there is no permanent deletion.
+
+        Raises:
+            NotAFileError: the item is not a regular file.
+            PathNotFoundError: the file does not exist.
+            AppNotInstalledError: ``gio`` is not available.
+            FileOperationError: ``gio trash`` failed or timed out.
+        """
+        path = self._safe_child(name)
+        try:
+            mode = os.lstat(path).st_mode
+        except OSError as exc:
+            raise self._os_error(exc) from exc
+        if not stat.S_ISREG(mode):
+            raise NotAFileError("Only regular files can be deleted.")
+        gio = shutil.which("gio", path=self._search_path)
+        if gio is None:
+            raise AppNotInstalledError(
+                "gio is not installed, so nothing was deleted "
+                "(permanent deletion is disabled).")
+        try:
+            result = subprocess.run(
+                [gio, "trash", "--", str(path)],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=TRASH_TIMEOUT_SECONDS,
+                shell=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise FileOperationError("Moving the file to the trash timed out.") from exc
+        except OSError as exc:
+            raise self._os_error(exc) from exc
+        if result.returncode != 0:
+            logger.error("gio trash failed with exit code %s", result.returncode)
+            raise FileOperationError("Could not move the file to the trash.")
+        logger.info("Moved a file to the trash")
